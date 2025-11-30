@@ -1,0 +1,199 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#define VAR_COUNT 40
+#define FOOTER_COUNT 46
+#define MARKER_LEN 4
+#define STARTING_CAPACITY 1000
+
+float to_float(uint32_t val) {
+    union {
+        uint32_t i;
+        float f;
+    } u;
+    u.i = ((val >> 24) & 0xff) |
+          ((val >> 8)  & 0xff00) |
+          ((val << 8)  & 0xff0000) |
+          ((val << 24) & 0xff000000);
+    return u.f;
+}
+
+const unsigned char marker[MARKER_LEN] = {0xB1, 0xB1, 0xB1, 0xB2};
+
+uint32_t **vars_history = NULL;
+uint32_t **footers_history = NULL;
+int *data_points = NULL;
+int total_rows = 0;
+
+int compare_marker(const unsigned char *data) {
+    return memcmp(data, marker, MARKER_LEN) == 0;
+}
+
+void free_memory() {
+    for (int i = 0; i < total_rows; i++) {
+        free(vars_history[i]);
+        free(footers_history[i]);
+    }
+    free(vars_history);
+    free(footers_history);
+    free(data_points);
+}
+
+void write_combined_header(FILE *out) {
+    fprintf(out, "Start Address,End Address,Bytes Count,Bits,Data Points,Row,");
+    for (int i = 0; i < VAR_COUNT; i++) {
+        if (i == 5 || i == 11 || i == 12 || i == 13 || i == 14 || i == 16) {
+            fprintf(out, "Var%d,", i); // as float only
+        } else {
+            fprintf(out, "Var%d,", i);
+        }
+    }
+    fprintf(out,
+        "Var0_0,Var0_1,Var1_0,Var1_1,Var1_2,Var1_3,Var2_Scaled,Var3_Scaled,"
+        "Var18_0,Var18_1,Var19_0,Var19_1,Var20_0,Var20_1,Var24_0,Var24_1,"
+        "Var29_Scaled,Var30_0,Var30_1,Var31_0,Var31_1,Var31_2,"
+        "Var33_0,Var33_1,Var34_0,Var34_1,");
+    for (int i = 0; i < FOOTER_COUNT; i++) {
+        if ((i <= 17) || (i >= 22 && i <= 25) || i == 28) {
+            fprintf(out, "FooterVar%d,", i); // as float only
+        } else {
+            fprintf(out, "FooterVar%d,", i);
+        }
+    }
+    fprintf(out,
+        "FooterVar18_0,FooterVar18_1,FooterVar19_0,FooterVar19_1,FooterVar20_0,FooterVar20_1,"
+        "FooterVar21_0,FooterVar21_1,FooterVar29_0,FooterVar29_1\n");
+}
+
+void write_combined_row(FILE *out, int row, long start_addr, long end_addr, long byte_diff, long bit_diff) {
+    fprintf(out, "%ld,%ld,%ld,%ld,%d,%d,", start_addr, end_addr, byte_diff, bit_diff, data_points[row], row);
+
+    for (int i = 0; i < VAR_COUNT; i++) {
+        if (i == 5 || i == 11 || i == 12 || i == 13 || i == 14 || i == 16) {
+            fprintf(out, "%.2f,", to_float(vars_history[row][i]));
+        } else {
+            fprintf(out, "%u,", vars_history[row][i]);
+        }
+    }
+
+    uint32_t v;
+    v = vars_history[row][0]; fprintf(out, "%u,%u,", (uint16_t)(v >> 16), (uint16_t)v);
+    v = vars_history[row][1];
+    fprintf(out, "%u,%u,%u,%u,", (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v);
+    fprintf(out, "%.2f,%.2f,", vars_history[row][2] / 105.0f, vars_history[row][3] / 125.0f);
+
+    int split_vars[] = {18, 19, 20, 24};
+    for (int i = 0; i < 4; i++) {
+        v = vars_history[row][split_vars[i]];
+        fprintf(out, "%u,%u,", (uint16_t)(v >> 16), (uint16_t)v);
+    }
+    fprintf(out, "%.2f,", vars_history[row][29] / 105.0f);
+    v = vars_history[row][30]; fprintf(out, "%u,%u,", (uint16_t)(v >> 16), (uint16_t)v);
+    v = vars_history[row][31];
+    fprintf(out, "%u,%u,%u,", (uint16_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v);
+    int last_vars[] = {33, 34};
+    for (int i = 0; i < 2; i++) {
+        v = vars_history[row][last_vars[i]];
+        fprintf(out, "%u,%u,", (uint16_t)(v >> 16), (uint16_t)v);
+    }
+
+    for (int i = 0; i < FOOTER_COUNT; i++) {
+        if ((i <= 17) || (i >= 22 && i <= 25) || i == 28) {
+            fprintf(out, "%.2f,", to_float(footers_history[row][i]));
+        } else {
+            fprintf(out, "%u,", footers_history[row][i]);
+        }
+    }
+
+    int footer_pairs[] = {18, 19, 20, 21, 29};
+    for (int i = 0; i < 5; i++) {
+        v = footers_history[row][footer_pairs[i]];
+        fprintf(out, "%u,%u", (uint16_t)(v >> 16), (uint16_t)v);
+        if (i < 4) fprintf(out, ",");
+    }
+    fprintf(out, "\n");
+}
+
+void process_file(const char *filepath) {
+    FILE *file = fopen(filepath, "rb");
+    if (!file) {
+        printf("\u274C Error: Cannot open file %s\n", filepath);
+        return;
+    }
+    FILE *out = fopen("output.csv", "w");
+    if (!out) {
+        printf("\u274C Error: Cannot create output.csv\n");
+        fclose(file);
+        return;
+    }
+
+    long start_addr = -1, end_addr = -1;
+    unsigned char buffer[4];
+    int offset_bits = (41 + (334 * 2) / 4 + (336 * 8) / 4) * 32 + 512;
+    int offset_bytes = offset_bits / 8;
+    int capacity = STARTING_CAPACITY;
+    vars_history = malloc(capacity * sizeof(uint32_t *));
+    footers_history = malloc(capacity * sizeof(uint32_t *));
+    data_points = malloc(capacity * sizeof(int));
+
+    write_combined_header(out);
+
+    long file_pos = 0;
+    while (fread(buffer, 1, 4, file) == 4) {
+        if (compare_marker(buffer)) {
+            if (start_addr == -1) {
+                start_addr = file_pos;
+            } else {
+                end_addr = file_pos + 3;
+                long byte_diff = end_addr - start_addr + 1;
+                long bit_diff = byte_diff * 8;
+                long datapoints = bit_diff / 32;
+
+                if (total_rows >= capacity) {
+                    capacity *= 2;
+                    vars_history = realloc(vars_history, capacity * sizeof(uint32_t *));
+                    footers_history = realloc(footers_history, capacity * sizeof(uint32_t *));
+                    data_points = realloc(data_points, capacity * sizeof(int));
+                }
+
+                vars_history[total_rows] = malloc(VAR_COUNT * sizeof(uint32_t));
+                footers_history[total_rows] = malloc(FOOTER_COUNT * sizeof(uint32_t));
+                data_points[total_rows] = (int)datapoints;
+
+                fseek(file, start_addr + MARKER_LEN, SEEK_SET);
+                fread(vars_history[total_rows], sizeof(uint32_t), VAR_COUNT, file);
+                fseek(file, start_addr + offset_bytes, SEEK_SET);
+                fread(footers_history[total_rows], sizeof(uint32_t), FOOTER_COUNT, file);
+
+                write_combined_row(out, total_rows, start_addr, end_addr, byte_diff, bit_diff);
+
+                total_rows++;
+                start_addr = -1;
+                fseek(file, end_addr + 1, SEEK_SET);
+                file_pos = end_addr + 1;
+                continue;
+            }
+        }
+        fseek(file, ++file_pos, SEEK_SET);
+    }
+
+    fclose(file);
+    fclose(out);
+    free_memory();
+
+    printf("\u2705 Output saved to output.csv\n");
+    printf("\u2705 Total Rows Extracted: %d\n", total_rows);
+}
+
+int main() {
+    char filepath[260];
+    printf("Enter path to .dat file: ");
+    fgets(filepath, sizeof(filepath), stdin);
+    filepath[strcspn(filepath, "\n")] = 0;
+    process_file(filepath);
+    printf("Press Enter to exit...");
+    getchar();
+    return 0;
+}
